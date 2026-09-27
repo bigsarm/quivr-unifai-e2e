@@ -1,0 +1,52 @@
+name: Lineaje UnifAI Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_fix_pr:
+        description: "Open a remediation PR with the remediation suggestions"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  lineaje-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install mcp==1.27.1 httpx
+
+      - name: Prepare scanner
+        run: |
+          cp .github/scm_unifai_scan_hybrid.py /tmp/scm_unifai_scan_hybrid.py
+          rm -rf .github .git
+
+      - name: Run Lineaje AI policy scan
+        env:
+          LINEAJE_PAT_TOKEN: ${{ secrets.LINEAJE_PAT_TOKEN }}
+          # Remediation PR token. GITHUB_TOKEN cannot open PRs when the org disables
+          # "Allow GitHub Actions to create and approve pull requests"; set the
+          # LINEAJE_FIX_PR_TOKEN secret (fine-grained PAT or GitHub App token with
+          # Contents + Pull requests: Read and write on this repo) to use it instead.
+          GH_TOKEN: ${{ secrets.GH_TOKEN || secrets.GITHUB_TOKEN }}
+          MCP_TLS_INSECURE_SKIP_VERIFY: "1"
+        run: |
+          python /tmp/scm_unifai_scan_hybrid.py \
+            --source-path . \
+            --repo ${{ github.repository }} \
+            --branch ${{ github.ref_name }} \
+            --head-sha ${{ github.sha }} \
+            --mcp-server-url https://mcp-code.v2.prod.veedna.com/mcp \
+            ${{ inputs.create_fix_pr && '--create-fix-pr' || '' }} >> "$GITHUB_STEP_SUMMARY"
