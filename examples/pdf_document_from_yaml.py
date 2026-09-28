@@ -1,7 +1,11 @@
 import asyncio
 import logging
 import os
+import re
+import tempfile
 from pathlib import Path
+
+from pypdf import PdfReader, PdfWriter
 
 import dotenv
 from quivr_core import Brain
@@ -22,6 +26,99 @@ logger.addHandler(ConsoleOutputHandler)
 
 # Install rich's traceback handler to automatically format tracebacks
 rich_install()
+
+
+_PHONE_PATTERN = re.compile(r"(?:\+1[ .-]?)?(?:\(\d{3}\)|\b\d{3})[ .-]?\d{3}[ .-]?\d{4}\b|\+\d{1,3}[ .-]?\d{1,4}[ .-]?\d{3,4}[ .-]?\d{4,}")
+_EMAIL_PATTERN = re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")
+_SSN_PATTERN = re.compile(r"\b\d{3}[- ]\d{2}[- ]\d{4}\b")
+_ADDRESS_PATTERN = re.compile(r"\b\d{1,5}\s+(?:[A-Z][a-z]+(?:[-\s][A-Z][a-z]+){0,2}\s){0,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way)\b\.?(?:,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)*)?(?:,\s*[A-Z]{2}\b(?:\s+\d{5}(?:-\d{4})?)?)?(?:,\s*(?:USA|United States)\b)?")
+_CREDIT_CARD_PATTERN = re.compile(r"\b(?:\d[ -]*?){13,19}\b")
+_IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_MAC_ADDRESS_PATTERN = re.compile(r"\b(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}\b")
+_DOB_PATTERN = re.compile(r"(?i)\b(?:DOB|date of birth|born(?: on| in)?)\s*:?\s*(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|(?:19|20)\d{2})\b")
+_PASSPORT_PATTERN = re.compile(r"(?i)\bpassport(?:\s*(?:no\.?|number|#))?\s*:?\s*(?=[A-Z0-9]*\d)[A-Z0-9]{6,9}\b")
+_DRIVERS_LICENSE_PATTERN = re.compile(r"(?i)\b(?:driver'?s license|drivers license|driver license)(?:\s*(?:no\.?|number|#))?\s*:?\s*[A-Z0-9-]{4,20}\b")
+_TAX_ID_PATTERN = re.compile(r"(?i)\b(?:taxpayer identification number|tax id|tin)(?:\s*(?:no\.?|number|#))?\s*:?\s*[A-Z0-9-]{6,20}\b")
+_ACCOUNT_NUMBER_PATTERN = re.compile(r"(?i)\b(?:financial account|account number|account no\.?)(?:\s*(?:number|#))?\s*:?\s*[A-Z0-9-]{6,20}\b")
+_EMPLOYEE_ID_PATTERN = re.compile(r"(?i)\bemployee id\s*:?\s*[A-Z0-9-]{2,20}\b")
+_SCHOOL_ID_PATTERN = re.compile(r"(?i)\bschool id\s*:?\s*[A-Z0-9-]{2,20}\b")
+_VIN_PATTERN = re.compile(r"(?i)\b(?:vehicle identification number|vin)\s*:?\s*[A-HJ-NPR-Z0-9]{11,17}\b")
+_BIRTHPLACE_PATTERN = re.compile(r"(?i)\b(?:birthplace|place of birth|born in)\s*:?\s*[^\n,;]+")
+_MAIDEN_NAME_PATTERN = re.compile(r"(?i)\b(?:mother'?s maiden name|maiden name)\s*:?\s*[^\n,;]+")
+_MEDICAL_PATTERN = re.compile(r"(?i)\bmedical records?\s*:?\s*[^\n]+")
+_LOCATION_PATTERN = re.compile(r"(?i)\b(?:fine location|precise location|exact location|gps coordinates?)\s*:?\s*[^\n,;]+")
+_ETHNICITY_PATTERN = re.compile(r"(?i)\bethnicity\s*:?\s*[^\n,;]+")
+_SEXUAL_ORIENTATION_PATTERN = re.compile(r"(?i)\bsexual orientation\s*:?\s*[^\n,;]+")
+
+_REDACTION_PATTERNS = [
+    ("ssn", _SSN_PATTERN),
+    ("phone", _PHONE_PATTERN),
+    ("email", _EMAIL_PATTERN),
+    ("address", _ADDRESS_PATTERN),
+    ("dob", _DOB_PATTERN),
+    ("passport", _PASSPORT_PATTERN),
+    ("drivers_license", _DRIVERS_LICENSE_PATTERN),
+    ("tax_id", _TAX_ID_PATTERN),
+    ("credit_card", _CREDIT_CARD_PATTERN),
+    ("account_number", _ACCOUNT_NUMBER_PATTERN),
+    ("employee_id", _EMPLOYEE_ID_PATTERN),
+    ("school_id", _SCHOOL_ID_PATTERN),
+    ("vin", _VIN_PATTERN),
+    ("ip_address", _IP_ADDRESS_PATTERN),
+    ("mac_address", _MAC_ADDRESS_PATTERN),
+    ("birthplace", _BIRTHPLACE_PATTERN),
+    ("maiden_name", _MAIDEN_NAME_PATTERN),
+    ("medical", _MEDICAL_PATTERN),
+    ("location", _LOCATION_PATTERN),
+    ("ethnicity", _ETHNICITY_PATTERN),
+    ("sexual_orientation", _SEXUAL_ORIENTATION_PATTERN),
+]
+
+_LAST4_CATEGORIES = {"ssn", "credit_card", "account_number"}
+
+
+def redact_pii(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    redacted = text
+    for category, pattern in _REDACTION_PATTERNS:
+        redacted = pattern.sub(f"<redacted:{category}>", redacted)
+    return redacted
+
+
+
+def mask_pii(text: str) -> str:
+    if not isinstance(text, str):
+        return text
+    masked = text
+    for category, pattern in _REDACTION_PATTERNS:
+        if category in _LAST4_CATEGORIES:
+            def _mask_last4(match, pii_category=category):
+                value = match.group(0)
+                digits = re.sub(r"\D", "", value)
+                if len(digits) >= 4:
+                    return f"<masked:{pii_category}:{digits[-4:]}>"
+                return f"<masked:{pii_category}>"
+
+            masked = pattern.sub(_mask_last4, masked)
+        else:
+            masked = pattern.sub(f"<masked:{category}>", masked)
+    return masked
+
+
+
+def _write_redacted_pdf_copy(source_path: Path) -> str:
+    reader = PdfReader(str(source_path))
+    writer = PdfWriter()
+    extracted_chunks = []
+    for page in reader.pages:
+        extracted_chunks.append(page.extract_text() or "")
+        writer.add_page(page)
+    writer.add_metadata({"/RedactedText": redact_pii("\n".join(extracted_chunks))})
+    temp_file = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    with open(temp_file.name, "wb") as redacted_pdf:
+        writer.write(redacted_pdf)
+    return temp_file.name
 
 
 async def main():
@@ -48,9 +145,13 @@ async def main():
         "splitter_config": assistant_config.ingestion_config.parser_config.splitter_config,
     }
 
+    sanitized_file_paths = [
+        Path(_write_redacted_pdf_copy(path)) for path in file_path
+    ]
+
     brain = await Brain.afrom_files(
         name="test_brain",
-        file_paths=file_path,
+        file_paths=sanitized_file_paths,
         processor_kwargs=processor_kwargs,
     )
 
@@ -131,9 +232,16 @@ async def main():
 
     retrieval_config = assistant_config.retrieval_config
     for i, (question, truth) in enumerate(zip(questions, answers, strict=False)):
+        question = redact_pii(question)
         chunk = brain.ask(question=question, retrieval_config=retrieval_config)
+        answer_text = redact_pii(chunk.answer)
         print(
-            "\n Question: ", question, "\n Answer: ", chunk.answer, "\n Truth: ", truth
+            "\n Question: ",
+            mask_pii(question),
+            "\n Answer: ",
+            mask_pii(answer_text),
+            "\n Truth: ",
+            mask_pii(truth),
         )
         if i == 5:
             break
