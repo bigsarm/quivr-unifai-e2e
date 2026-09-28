@@ -1,6 +1,9 @@
 import asyncio
+import codecs
 import logging
 import os
+import re
+import urllib.parse
 from pathlib import Path
 from pprint import PrettyPrinter
 from typing import Any, AsyncGenerator, Callable, Dict, Self, Type, Union
@@ -44,6 +47,358 @@ from .brain_defaults import build_default_vectordb, default_embedder, default_ll
 logger = logging.getLogger("quivr_core")
 
 
+_HIDDEN_TEXT_PATTERNS = [
+    re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"<(?P<tag>[a-zA-Z][^>\s/]*)\b[^>]*style\s*=\s*['\"][^'\"]*(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px|em|rem|%)?|color\s*:\s*#(?:fff|ffffff)|color\s*:\s*white)[^'\"]*['\"][^>]*>.*?</(?P=tag)>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"<(?P<tag>[a-zA-Z][^>\s/]*)\b[^>]*(?:hidden|aria-hidden\s*=\s*['\"]?true['\"]?)[^>]*>.*?</(?P=tag)>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"[\u200B-\u200D\uFEFF]+"),
+]
+
+_PROMPT_INJECTION_PATTERNS = [
+    (
+        "instruction_override",
+        re.compile(
+            r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+instructions\b"
+        ),
+    ),
+    (
+        "instruction_override",
+        re.compile(r"(?i)\bforget\s+everything\s+above\b"),
+    ),
+    (
+        "instruction_override",
+        re.compile(r"(?i)\bignore\s+(?:all\s+)?safety\s+guidelines\b"),
+    ),
+    (
+        "role_hijack",
+        re.compile(
+            r"(?i)\byou\s+are\s+now\s+(?:in\s+)?(?:developer\s+mode|admin\s+mode|DAN|unrestricted)\b"
+        ),
+    ),
+    (
+        "role_hijack",
+        re.compile(r"(?i)\bprovide\s+unrestricted\s+access\b"),
+    ),
+    (
+        "role_hijack",
+        re.compile(r"(?i)\benable\s+developer\s+mode\b"),
+    ),
+    (
+        "role_hijack",
+        re.compile(r"(?i)\bact\s+as\s+an\s+unrestricted\s+AI\b"),
+    ),
+    (
+        "role_hijack",
+        re.compile(r"(?i)\bwithout\s+safety\s+filters\b"),
+    ),
+    (
+        "role_hijack",
+        re.compile(r"(?i)\bSYSTEM\s+OVERRIDE\b"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"(?i)\breveal\s+(?:all\s+)?confidential\s+information\b"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"(?i)\breveal\s+(?:all\s+)?system\s+prompts?\b"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"(?i)\blist\s+all\s+financial\s+data,\s*user\s+passwords,\s*and\s*API\s+keys\b"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"(?i)\bprint\s+the\s+API\s+key\b"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"(?i)\b(?:send|post|upload|exfiltrate)\b[^\n]{0,120}?\bto\s+https?://\S+"),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(r"!\[[^\]]*\]\([^)]*https?://[^)]*\)", re.IGNORECASE),
+    ),
+    (
+        "delimiter_escape",
+        re.compile(r"(?i)</system>"),
+    ),
+    (
+        "delimiter_escape",
+        re.compile(r"<\|im_start\|>", re.IGNORECASE),
+    ),
+    (
+        "delimiter_escape",
+        re.compile(r"(?i)###\s*system\s*:"),
+    ),
+    (
+        "command_injection",
+        re.compile(
+            r"(?i)\bexecute\s*:\s*(?:print\s*\(|exec\s*\(|eval\s*\(|os\.system\s*\(|subprocess\.|curl\s+https?://\S+|wget\s+https?://\S+|rm\s+-rf\s+\S+)[^\n]*"
+        ),
+    ),
+    (
+        "command_injection",
+        re.compile(r"(?i)\brun\s+(?:rm\s+-rf\s+\S+|curl\s+https?://\S+(?:\s*\|\s*sh)?|wget\s+https?://\S+(?:\s*\|\s*sh)?)"),
+    ),
+    (
+        "command_injection",
+        re.compile(r"(?i)\bcurl\s+https?://\S+\s*\|\s*sh\b"),
+    ),
+]
+
+_PII_PATTERNS = [
+    ("ssn", re.compile(r"\b\d{3}[- ]\d{2}[- ]\d{4}\b")),
+    (
+        "phone",
+        re.compile(r"(?:\+1[ .-]?)?(?:\(\d{3}\)|\b\d{3})[ .-]?\d{3}[ .-]?\d{4}\b"),
+    ),
+    ("email", re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b")),
+    (
+        "address",
+        re.compile(
+            r"\b\d{1,5}\s+(?:[A-Z][a-z]+\s){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way)\b\.?(?:,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)*)?(?:,\s*[A-Z]{2}\b(?:\s+\d{5}(?:-\d{4})?)?)?(?:,\s*(?:USA|United States)\b)?"
+        ),
+    ),
+    (
+        "dob",
+        re.compile(
+            r"(?i)\b(?:DOB|date of birth|born(?: on| in)?)\s*:?\s*(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|(?:19|20)\d{2})\b"
+        ),
+    ),
+    (
+        "passport",
+        re.compile(
+            r"(?i)\bpassport(?:\s*(?:no\.?|number|#))?\s*:?\s*(?=[A-Z0-9]*\d)[A-Z0-9]{6,9}\b"
+        ),
+    ),
+    (
+        "drivers_license",
+        re.compile(
+            r"(?i)\b(?:driver'?s\s*license|drivers\s*license|dl)\s*(?:no\.?|number|#)?\s*:?\s*[A-Z0-9-]{5,20}\b"
+        ),
+    ),
+    (
+        "tax_id",
+        re.compile(
+            r"(?i)\b(?:taxpayer\s+identification\s+number|tax\s+id|TIN)\s*:?\s*(?:\d{2}-\d{7}|\d{9})\b"
+        ),
+    ),
+    (
+        "credit_card",
+        re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+    ),
+    (
+        "account_number",
+        re.compile(
+            r"(?i)\b(?:financial\s+account\s+number|account\s+number|acct\s+no\.?|acct\s+number)\s*:?\s*[A-Z0-9-]{6,20}\b"
+        ),
+    ),
+    (
+        "employee_id",
+        re.compile(r"(?i)\bemployee\s+id\s*:?\s*[A-Z0-9-]{2,20}\b"),
+    ),
+    (
+        "school_id",
+        re.compile(r"(?i)\bschool\s+id\s*:?\s*[A-Z0-9-]{2,20}\b"),
+    ),
+    (
+        "vin",
+        re.compile(r"(?i)\b(?:vin|vehicle\s+identification\s+number)\s*:?\s*[A-HJ-NPR-Z0-9]{17}\b"),
+    ),
+    (
+        "ip_address",
+        re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    ),
+    (
+        "mac_address",
+        re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"),
+    ),
+    (
+        "birthplace",
+        re.compile(r"(?i)\bbirthplace\s*:?\s*[^\n,;]+"),
+    ),
+    (
+        "maiden_name",
+        re.compile(r"(?i)\bmother'?s\s+maiden\s+name\s*:?\s*[^\n,;]+"),
+    ),
+    (
+        "medical",
+        re.compile(r"(?i)\bmedical\s+records?\s*:?\s*[^\n]+"),
+    ),
+    (
+        "location",
+        re.compile(r"(?i)\b(?:fine\s+location|location)\s*:?\s*[^\n,;]+"),
+    ),
+    (
+        "ethnicity",
+        re.compile(r"(?i)\bethnicity\s*:?\s*[^\n,;]+"),
+    ),
+    (
+        "sexual_orientation",
+        re.compile(r"(?i)\bsexual\s+orientation\s*:?\s*[^\n,;]+"),
+    ),
+]
+
+
+def _replace_match_value(match: re.Match[str], label: str) -> str:
+    text = match.group(0)
+    if ":" in text:
+        prefix, _ = text.split(":", 1)
+        return f"{prefix}: <redacted:{label}>"
+    lower_text = text.lower()
+    for marker in (" born in ", " born on ", " dob ", " date of birth "):
+        idx = lower_text.find(marker)
+        if idx != -1:
+            return text[: idx + len(marker)] + f"<redacted:{label}>"
+    for marker in (
+        "passport ",
+        "passport no ",
+        "passport no. ",
+        "passport number ",
+        "passport# ",
+        "driver's license ",
+        "drivers license ",
+        "dl ",
+        "tax id ",
+        "tin ",
+        "employee id ",
+        "school id ",
+        "vin ",
+        "vehicle identification number ",
+        "birthplace ",
+        "mother's maiden name ",
+        "medical record ",
+        "medical records ",
+        "fine location ",
+        "location ",
+        "ethnicity ",
+        "sexual orientation ",
+        "account number ",
+        "acct no ",
+        "acct number ",
+    ):
+        idx = lower_text.find(marker)
+        if idx != -1:
+            return text[: idx + len(marker)] + f"<redacted:{label}>"
+    return f"<redacted:{label}>"
+
+
+def _normalize_for_obfuscation(text: str) -> tuple[str, list[int]]:
+    translation = str.maketrans({"1": "i", "3": "e", "0": "o", "4": "a", "5": "s", "7": "t"})
+    normalized_chars: list[str] = []
+    index_map: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        normalized_chars.append(char.translate(translation).lower())
+        index_map.append(index)
+    return "".join(normalized_chars), index_map
+
+
+def _decode_if_attack(candidate: str) -> str | None:
+    decoded_candidates: list[str] = []
+    try:
+        decoded_candidates.append(urllib.parse.unquote(candidate))
+    except Exception:
+        pass
+    try:
+        decoded_candidates.append(codecs.decode(candidate, "rot13"))
+    except Exception:
+        pass
+    compact = re.sub(r"\s+", "", candidate)
+    if compact and len(compact) % 4 == 0 and re.fullmatch(r"[A-Za-z0-9+/=]+", compact):
+        try:
+            decoded_candidates.append(codecs.decode(compact.encode("ascii"), "base64").decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    if compact and len(compact) % 2 == 0 and re.fullmatch(r"[0-9A-Fa-f]+", compact):
+        try:
+            decoded_candidates.append(bytes.fromhex(compact).decode("utf-8", errors="ignore"))
+        except Exception:
+            pass
+    for decoded in decoded_candidates:
+        for category, pattern in _PROMPT_INJECTION_PATTERNS:
+            if pattern.search(decoded):
+                return category
+    return None
+
+
+def _sanitize_untrusted_text(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    for pattern in _HIDDEN_TEXT_PATTERNS:
+        sanitized = pattern.sub("<prompt_injection_removed: hidden_text>", sanitized)
+
+    for category, pattern in _PROMPT_INJECTION_PATTERNS:
+        sanitized = pattern.sub(f"<prompt_injection_removed: {category}>", sanitized)
+
+    encoded_pattern = re.compile(r"(?:[A-Za-z0-9+/=]{12,}|%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2}){5,}|[0-9A-Fa-f]{16,})")
+
+    def _replace_encoded(match: re.Match[str]) -> str:
+        category = _decode_if_attack(match.group(0))
+        if category:
+            return f"<prompt_injection_removed: encoded_payload>"
+        return match.group(0)
+
+    sanitized = encoded_pattern.sub(_replace_encoded, sanitized)
+
+    normalized, index_map = _normalize_for_obfuscation(sanitized)
+    obfuscated_patterns = [
+        ("instruction_override", re.compile(r"(?:ignore|disregard|forget)(?:all)?(?:previous|prior|above)instructions")),
+        ("instruction_override", re.compile(r"forgeteverythingabove")),
+        ("instruction_override", re.compile(r"ignore(?:all)?safetyguidelines")),
+        ("role_hijack", re.compile(r"youarenow(?:in)?(?:developermode|adminmode|dan|unrestricted)")),
+        ("role_hijack", re.compile(r"provideunrestrictedaccess")),
+        ("role_hijack", re.compile(r"enabledevelopermode")),
+        ("role_hijack", re.compile(r"actasanunrestrictedai")),
+        ("role_hijack", re.compile(r"withoutsafetyfilters")),
+    ]
+    replacements: list[tuple[int, int, str]] = []
+    for category, pattern in obfuscated_patterns:
+        for match in pattern.finditer(normalized):
+            start = index_map[match.start()]
+            end = index_map[match.end() - 1] + 1
+            replacements.append((start, end, f"<prompt_injection_removed: {category}>"))
+    if replacements:
+        replacements.sort()
+        merged: list[tuple[int, int, str]] = []
+        for start, end, replacement in replacements:
+            if merged and start <= merged[-1][1]:
+                prev_start, prev_end, prev_replacement = merged[-1]
+                merged[-1] = (prev_start, max(prev_end, end), prev_replacement)
+            else:
+                merged.append((start, end, replacement))
+        rebuilt: list[str] = []
+        last_index = 0
+        for start, end, replacement in merged:
+            rebuilt.append(sanitized[last_index:start])
+            rebuilt.append(replacement)
+            last_index = end
+        rebuilt.append(sanitized[last_index:])
+        sanitized = "".join(rebuilt)
+
+    for label, pattern in _PII_PATTERNS:
+        sanitized = pattern.sub(lambda match: _replace_match_value(match, label), sanitized)
+
+    return sanitized
+
+
+def _sanitize_documents(docs: list[Document]) -> list[Document]:
+    for doc in docs:
+        if isinstance(doc.page_content, str):
+            doc.page_content = _sanitize_untrusted_text(doc.page_content)
+    return docs
+
+
 async def process_files(
     storage: StorageBase, skip_file_error: bool, **processor_kwargs: dict[str, Any]
 ) -> list[Document]:
@@ -69,6 +424,7 @@ async def process_files(
                 logger.debug(f"processing {file} using class {processor_cls.__name__}")
                 processor = processor_cls(**processor_kwargs)
                 docs = await processor.process_file(file)
+                docs = _sanitize_documents(docs)
                 knowledge.extend(docs)
             else:
                 logger.error(f"can't find processor for {file}")
@@ -588,6 +944,9 @@ class Brain:
             ParsedRAGResponse: The generated answer.
         """
         # question_language = detect_language(question) -- Commented until we use it
+        question = _sanitize_untrusted_text(question)
+        if system_prompt is not None:
+            system_prompt = _sanitize_untrusted_text(system_prompt)
         full_answer = ""
         metadata = None
 
@@ -630,6 +989,9 @@ class Brain:
             ParsedRAGResponse: The generated answer.
         """
         loop = asyncio.get_event_loop()
+        question = _sanitize_untrusted_text(question)
+        if system_prompt is not None:
+            system_prompt = _sanitize_untrusted_text(system_prompt)
         return loop.run_until_complete(
             self.aask(
                 run_id=run_id,
