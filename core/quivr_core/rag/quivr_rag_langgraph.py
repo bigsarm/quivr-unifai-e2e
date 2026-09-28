@@ -1,6 +1,10 @@
 import asyncio
+import codecs
 import datetime
 import logging
+import re
+import urllib.parse
+from base64 import b64decode
 from collections import OrderedDict
 from typing import (
     Annotated,
@@ -55,6 +59,308 @@ from quivr_core.rag.utils import (
 )
 
 logger = logging.getLogger("quivr_core")
+
+_PII_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"\b\d{3}[- ]\d{2}[- ]\d{4}\b"), "ssn"),
+    (
+        re.compile(
+            r"(?:\+1[ .-]?)?(?:\(\d{3}\)|\b\d{3})[ .-]?\d{3}[ .-]?\d{4}\b"
+        ),
+        "phone",
+    ),
+    (re.compile(r"\b[\w.+-]+@[\w-]+(?:\.[\w-]+)+\b"), "email"),
+    (
+        re.compile(
+            r"\b\d{1,5}\s+(?:[A-Z][a-z]+\s){1,3}(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Lane|Ln|Drive|Dr|Court|Ct|Way)\b\.?"
+            r"(?:,\s*[A-Z][a-z]+(?:\s[A-Z][a-z]+)*)?(?:,\s*[A-Z]{2}\b(?:\s+\d{5}(?:-\d{4})?)?)?(?:,\s*(?:USA|United States)\b)?"
+        ),
+        "address",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:DOB|date of birth|born(?: on| in)?)\s*:?\s*(?:\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{2,4}|(?:19|20)\d{2})\b"
+        ),
+        "dob",
+    ),
+    (
+        re.compile(
+            r"(?i)\bpassport(?:\s*(?:no\.?|number|#))?\s*:?\s*(?=[A-Z0-9]*\d)[A-Z0-9]{6,9}\b"
+        ),
+        "passport",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:driver'?s license|drivers license|driver license|dl)\s*(?:no\.?|number|#)?\s*:?\s*[A-Z0-9-]{5,20}\b"
+        ),
+        "drivers_license",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:taxpayer identification number|tax id|tin|ein)\s*:?\s*[A-Z0-9-]{6,20}\b"
+        ),
+        "tax_id",
+    ),
+    (
+        re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+        "credit_card",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:account number|acct(?:ount)?\s*#|financial account number|iban)\s*:?\s*[A-Z0-9-]{6,34}\b"
+        ),
+        "account_number",
+    ),
+    (
+        re.compile(
+            r"(?i)\bemployee id\s*:?\s*[A-Z0-9-]{2,20}\b"
+        ),
+        "employee_id",
+    ),
+    (
+        re.compile(
+            r"(?i)\bschool id\s*:?\s*[A-Z0-9-]{2,20}\b"
+        ),
+        "school_id",
+    ),
+    (
+        re.compile(
+            r"(?i)\bvin\s*:?\s*[A-HJ-NPR-Z0-9]{17}\b|\bvehicle identification number\s*:?\s*[A-HJ-NPR-Z0-9]{17}\b"
+        ),
+        "vin",
+    ),
+    (
+        re.compile(
+            r"\b(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)\b"
+        ),
+        "ip_address",
+    ),
+    (
+        re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"),
+        "mac_address",
+    ),
+    (
+        re.compile(r"(?i)\bbirthplace\s*:?\s*[^\n,;]+"),
+        "birthplace",
+    ),
+    (
+        re.compile(r"(?i)\bmother'?s maiden name\s*:?\s*[^\n,;]+"),
+        "maiden_name",
+    ),
+    (
+        re.compile(r"(?i)\bmedical records?\s*:?\s*[^\n]+"),
+        "medical",
+    ),
+    (
+        re.compile(r"(?i)\b(?:fine location|location)\s*:?\s*[^\n]+"),
+        "location",
+    ),
+    (
+        re.compile(r"(?i)\bethnicity\s*:?\s*[^\n,;]+"),
+        "ethnicity",
+    ),
+    (
+        re.compile(r"(?i)\bsexual orientation\s*:?\s*[^\n,;]+"),
+        "sexual_orientation",
+    ),
+]
+
+_HIDDEN_TEXT_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"<[^>]*style=\"[^\"]*(?:display\s*:\s*none|font-size\s*:\s*0(?:px)?|color\s*:\s*white(?:\s*;)?\s*background(?:-color)?\s*:\s*white)[^\"]*\"[^>]*>.*?</[^>]+>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"<[^>]*style='[^']*(?:display\s*:\s*none|font-size\s*:\s*0(?:px)?|color\s*:\s*white(?:\s*;)?\s*background(?:-color)?\s*:\s*white)[^']*'[^>]*>.*?</[^>]+>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"[\u200B-\u200D\uFEFF]+"),
+]
+
+_ATTACK_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (
+        re.compile(
+            r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+instructions\b|\bforget everything above\b|\bignore(?:\s+all)?\s+safety guidelines\b"
+        ),
+        "instruction_override",
+    ),
+    (
+        re.compile(
+            r"(?i)\byou are now(?:\s+in)?\s+(?:developer mode|admin mode|dan|unrestricted)\b|\bprovide unrestricted access\b|\benable developer mode\b|\bact as an unrestricted ai\b|\bwithout safety filters\b|\bsystem override\b"
+        ),
+        "role_hijack",
+    ),
+    (
+        re.compile(
+            r"(?i)\breveal(?:\s+all)?\s+confidential information\b|\breveal(?:\s+all)?\s+system prompts?\b|\blist all financial data, user passwords, and API keys\b|\bprint the api key\b|!\[[^\]]*\]\([^)]*(?:data:|https?://)[^)]*\)|\b(?:send|post|upload|exfiltrate)\b.{0,80}\b(?:https?://|www\.)\S+"
+        ),
+        "exfiltration_attempt",
+    ),
+    (
+        re.compile(r"(?i)</system>|<\|im_start\|>|###\s*system:"),
+        "delimiter_escape",
+    ),
+    (
+        re.compile(
+            r"(?i)\b(?:execute|run|cmd|command)\s*:\s*[^\n]+|\brun\s+(?:rm\s+-rf\s+/|curl\s+\S+(?:\s*\|\s*sh)?|python\s+-c\s+[^\n]+|print\s*\(\s*os\.environ\.get\([^\n]+)"
+        ),
+        "command_injection",
+    ),
+]
+
+_LEETSPEAK_TRANSLATION = str.maketrans({"1": "i", "3": "e", "0": "o", "4": "a", "5": "s", "7": "t"})
+
+
+def _replace_match_value(text: str, pattern: re.Pattern[str], label: str) -> str:
+    return pattern.sub(lambda match: f"<redacted:{label}>", text)
+
+
+def redact_sensitive_text(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+    redacted = text
+    for pattern, label in _PII_PATTERNS:
+        redacted = _replace_match_value(redacted, pattern, label)
+    return redacted
+
+
+def _looks_like_attack(text: str) -> Optional[str]:
+    for pattern, category in _ATTACK_PATTERNS:
+        if pattern.search(text):
+            return category
+    return None
+
+
+def _sanitize_hidden_text(text: str) -> str:
+    sanitized = text
+    for pattern in _HIDDEN_TEXT_PATTERNS:
+        sanitized = pattern.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    return sanitized
+
+
+def _sanitize_direct_attacks(text: str) -> str:
+    sanitized = text
+    for pattern, category in _ATTACK_PATTERNS:
+        sanitized = pattern.sub(
+            lambda match: f"<prompt_injection_removed: {category}>", sanitized
+        )
+    return sanitized
+
+
+def _sanitize_encoded_payloads(text: str) -> str:
+    sanitized = text
+    encoded_spans: list[tuple[int, int, str]] = []
+
+    for match in re.finditer(r"\b[A-Za-z0-9+/]{16,}={0,2}\b", sanitized):
+        token = match.group(0)
+        try:
+            decoded = b64decode(token, validate=True).decode("utf-8", errors="ignore")
+        except Exception:
+            decoded = ""
+        if decoded and _looks_like_attack(decoded):
+            encoded_spans.append((match.start(), match.end(), "encoded_payload"))
+
+    for match in re.finditer(r"(?:%[0-9A-Fa-f]{2}){4,}", sanitized):
+        token = match.group(0)
+        try:
+            decoded = urllib.parse.unquote(token)
+        except Exception:
+            decoded = ""
+        if decoded and _looks_like_attack(decoded):
+            encoded_spans.append((match.start(), match.end(), "encoded_payload"))
+
+    for match in re.finditer(r"\b(?:[0-9A-Fa-f]{2}){8,}\b", sanitized):
+        token = match.group(0)
+        try:
+            decoded = bytes.fromhex(token).decode("utf-8", errors="ignore")
+        except Exception:
+            decoded = ""
+        if decoded and _looks_like_attack(decoded):
+            encoded_spans.append((match.start(), match.end(), "encoded_payload"))
+
+    for match in re.finditer(r"\b[A-Za-z]{12,}\b", sanitized):
+        token = match.group(0)
+        try:
+            decoded = codecs.decode(token, "rot13")
+        except Exception:
+            decoded = ""
+        if decoded and _looks_like_attack(decoded):
+            encoded_spans.append((match.start(), match.end(), "encoded_payload"))
+
+    for start, end, category in sorted(encoded_spans, reverse=True):
+        sanitized = (
+            sanitized[:start]
+            + f"<prompt_injection_removed: {category}>"
+            + sanitized[end:]
+        )
+
+    return sanitized
+
+
+def _sanitize_obfuscated_attacks(text: str) -> str:
+    normalized_chars: list[str] = []
+    index_map: list[int] = []
+    for index, char in enumerate(text):
+        translated = char.translate(_LEETSPEAK_TRANSLATION)
+        if translated.isalnum():
+            normalized_chars.append(translated.lower())
+            index_map.append(index)
+    normalized = "".join(normalized_chars)
+
+    spans: list[tuple[int, int, str]] = []
+    for pattern, category in _ATTACK_PATTERNS:
+        compact_pattern = re.sub(r"\\s\+", "", pattern.pattern)
+        compact_pattern = re.sub(r"\(\?:", "(", compact_pattern)
+        compact_pattern = re.sub(r"\(\?i\)", "", compact_pattern)
+        try:
+            compact_regex = re.compile(compact_pattern, re.IGNORECASE)
+        except re.error:
+            continue
+        for match in compact_regex.finditer(normalized):
+            start = index_map[match.start()]
+            end = index_map[match.end() - 1] + 1
+            spans.append((start, end, category))
+
+    sanitized = text
+    for start, end, category in sorted(spans, reverse=True):
+        sanitized = (
+            sanitized[:start]
+            + f"<prompt_injection_removed: {category}>"
+            + sanitized[end:]
+        )
+    return sanitized
+
+
+def sanitize_untrusted_text(text: Any) -> Any:
+    if not isinstance(text, str):
+        return text
+    sanitized = _sanitize_hidden_text(text)
+    sanitized = _sanitize_encoded_payloads(sanitized)
+    sanitized = _sanitize_direct_attacks(sanitized)
+    sanitized = _sanitize_obfuscated_attacks(sanitized)
+    return redact_sensitive_text(sanitized)
+
+
+def sanitize_message_list(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    sanitized_messages = []
+    for message in messages:
+        if isinstance(message, dict):
+            sanitized_message = dict(message)
+            if "content" in sanitized_message:
+                sanitized_message["content"] = sanitize_untrusted_text(
+                    sanitized_message["content"]
+                )
+            sanitized_messages.append(sanitized_message)
+        else:
+            sanitized_messages.append(message)
+    return sanitized_messages
+
+
+def sanitize_documents_text(docs: List[Document] | None) -> str:
+    return sanitize_untrusted_text(combine_documents(docs) if docs else "None")
+
 
 langfuse_service = LangfuseService()
 langfuse_handler = langfuse_service.get_handler()
@@ -1210,17 +1516,27 @@ class QuivrQARAGLangGraph:
         """
         messages = state["messages"]
         user_task = messages[0].content
+        user_task = sanitize_untrusted_text(user_task)
         files = state["files"]
+        files = sanitize_untrusted_text(files) if files else "None"
         prompt = self.retrieval_config.prompt
+        prompt = redact_sensitive_text(prompt) if prompt else "None"
+        chat_history = sanitize_message_list(state["chat_history"].to_list())
+        context = sanitize_documents_text(docs)
+        rephrased_task = (
+            [sanitize_untrusted_text(definition) for definition in state["tasks"].definitions]
+            if state["tasks"]
+            else "None"
+        )
         # available_tools, _ = collect_tools(self.retrieval_config.workflow_config)
 
         return {
-            "context": combine_documents(docs) if docs else "None",
+            "context": context,
             "task": user_task,
-            "rephrased_task": state["tasks"].definitions if state["tasks"] else "None",
-            "custom_instructions": prompt if prompt else "None",
-            "files": files if files else "None",
-            "chat_history": state["chat_history"].to_list(),
+            "rephrased_task": rephrased_task,
+            "custom_instructions": prompt,
+            "files": files,
+            "chat_history": chat_history,
             # "reasoning": state["reasoning"] if "reasoning" in state else "None",
             # "tools": available_tools,
         }
