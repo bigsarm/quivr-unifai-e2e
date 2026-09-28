@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import re
+import urllib.parse
 from pathlib import Path
 from pprint import PrettyPrinter
 from typing import Any, AsyncGenerator, Callable, Dict, Self, Type, Union
@@ -43,6 +45,197 @@ from .brain_defaults import build_default_vectordb, default_embedder, default_ll
 
 logger = logging.getLogger("quivr_core")
 
+logger.warning(
+    "Configured LLM components in core/quivr_core/brain/brain.py must be replaced with an organization-approved model from the registry; no approved allowlist is available, so disapproved models must not be used."
+)
+
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200D\u2060\uFEFF]")
+_HTML_HIDDEN_RE = re.compile(
+    r"<!--.*?(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|act\s+as|you\s+are\s+now|developer\s+mode|system\s+prompt|reveal\s+all\s+confidential\s+information|list\s+all\s+passwords\s+and\s+api\s+keys).*?-->",
+    re.IGNORECASE | re.DOTALL,
+)
+_CSS_HIDDEN_RE = re.compile(
+    r"<[^>]*style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0(?:px)?|color\s*:\s*(?:#fff(?:fff)?|white))[^\"']*[\"'][^>]*>.*?</[^>]+>",
+    re.IGNORECASE | re.DOTALL,
+)
+_BASE64_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{4}){8,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?\b")
+_HEX_RE = re.compile(r"\b(?:0x)?(?:[0-9a-fA-F]{2}){8,}\b")
+_URL_ENCODED_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}")
+_SPLIT_IGNORE_RE = re.compile(
+    r"i\W*g\W*n\W*o\W*r\W*e\W+.*?p\W*r\W*e\W*v\W*i\W*o\W*u\W*s\W+.*?i\W*n\W*s\W*t\W*r\W*u\W*c\W*t\W*i\W*o\W*n\W*s",
+    re.IGNORECASE,
+)
+_INSTRUCTION_OVERRIDE_PATTERNS = [
+    re.compile(r"\bignore\s+previous\s+instructions\b", re.IGNORECASE),
+    re.compile(r"\bforget\s+everything\s+above\b", re.IGNORECASE),
+    re.compile(r"\bdisregard\s+all\s+prior\s+instructions\b", re.IGNORECASE),
+]
+_ROLE_HIJACK_PATTERNS = [
+    re.compile(r"\byou\s+are\s+now\s+dan\b", re.IGNORECASE),
+    re.compile(r"\byou\s+are\s+now\s+in\s+admin\s+mode\b", re.IGNORECASE),
+    re.compile(r"\bact\s+as\s+(?:an\s+)?unrestricted\b", re.IGNORECASE),
+]
+_DELIMITER_ESCAPE_PATTERNS = [
+    re.compile(r"</?(?:system|assistant|tool|developer)>", re.IGNORECASE),
+    re.compile(r"(?:^|\n)\s*(?:---|===)\s*(?:$|\n)", re.MULTILINE),
+]
+_FAKE_SYSTEM_MESSAGE_PATTERNS = [
+    re.compile(r"\b(system|assistant|tool)\s*:\s*(?:ignore|reveal|send|list)\b", re.IGNORECASE),
+]
+_EXFILTRATION_PATTERNS = [
+    re.compile(r"!\[[^\]]*\]\(https?://[^)]+\)", re.IGNORECASE),
+    re.compile(r"\b(?:curl|wget)\s+https?://\S+", re.IGNORECASE),
+    re.compile(r"\b(?:send|post|upload|exfiltrate|leak)\b.{0,80}\b(?:https?://\S+|system\s+prompt|confidential\s+information|passwords?|api\s+keys?)\b", re.IGNORECASE | re.DOTALL),
+    re.compile(r"\b(?:reveal|list)\b.{0,80}\b(?:all\s+confidential\s+information|passwords?|api\s+keys?)\b", re.IGNORECASE | re.DOTALL),
+]
+_CONTEXT_POISONING_PATTERNS = [
+    re.compile(r"\bon\s+your\s+next\s+reply\b", re.IGNORECASE),
+    re.compile(r"\bfor\s+the\s+rest\s+of\s+this\s+conversation\b", re.IGNORECASE),
+]
+_JAILBREAK_PATTERNS = [
+    re.compile(r"\bdeveloper\s+mode\b", re.IGNORECASE),
+    re.compile(r"\bDAN\b", re.IGNORECASE),
+    re.compile(r"\bdo\s+anything\s+now\b", re.IGNORECASE),
+]
+_COMMAND_INJECTION_PATTERNS = [
+    re.compile(r"\b(?:rm\s+-rf\s+/|sudo\s+\S+|chmod\s+\+x\s+\S+|powershell\s+-enc\s+\S+|bash\s+-c\s+\S+|sh\s+-c\s+\S+|python\s+-c\s+\S+|nc\s+-e\s+\S+)\b", re.IGNORECASE),
+    re.compile(r"\b(?:os\.system|subprocess\.(?:run|Popen|call)|eval\s*\(|exec\s*\()", re.IGNORECASE),
+]
+_INDIRECT_INJECTION_PATTERNS = [
+    re.compile(r"\b(?:in\s+this\s+file|in\s+metadata|code\s+comment\s+says)\b.{0,120}\b(?:ignore\s+previous\s+instructions|act\s+as|you\s+are\s+now)\b", re.IGNORECASE | re.DOTALL),
+]
+_SSN_RE = re.compile(r"\b\d{3}-\d{2}-\d{4}\b")
+_PHONE_RE = re.compile(r"\b(?:\+1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]?\d{4}\b")
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_TIN_RE = re.compile(r"\b\d{2}-\d{7}\b")
+_CREDIT_CARD_RE = re.compile(r"\b(?:\d{4}[-\s]?){3}\d{4}\b")
+_VIN_RE = re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b")
+_IP_ADDRESS_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+_MAC_ADDRESS_RE = re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b")
+_FINANCIAL_ACCOUNT_RE = re.compile(r"\b(?:account(?:\s+number)?|acct(?:\s+no)?|iban)\s*[:#-]?\s*([0-9]{6,17})\b", re.IGNORECASE)
+_PII_LABEL_PATTERNS = [
+    (re.compile(r"\b(?:year\s+of\s+birth|yob|birth\s+year)\s*[:#-]?\s*(\d{4})\b", re.IGNORECASE), "year_of_birth"),
+    (re.compile(r"\b(?:birthplace|place\s+of\s+birth|born\s+in)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "birthplace"),
+    (re.compile(r"\b(?:mother'?s\s+maiden\s+name|maiden\s+name)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "mothers_maiden_name"),
+    (re.compile(r"\b(?:home\s+address|address)\s*[:#-]?\s*([^\n]+)", re.IGNORECASE), "home_address"),
+    (re.compile(r"\bpassport(?:\s+(?:number|no))?\s*[:#-]?\s*([A-Z0-9]{6,12})\b", re.IGNORECASE), "passport_number"),
+    (re.compile(r"\b(?:driver'?s\s+licen[cs]e(?:\s+number)?|dl\s*#)\s*[:#-]?\s*([A-Z0-9-]{5,20})\b", re.IGNORECASE), "drivers_license_number"),
+    (re.compile(r"\b(?:medical\s+record(?:s)?|medical\s+record\s+number|mrn)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "medical_records"),
+    (re.compile(r"\bemployee\s+id\s*[:#-]?\s*([A-Z0-9-]{2,20})\b", re.IGNORECASE), "employee_id"),
+    (re.compile(r"\bschool\s+id\s*[:#-]?\s*([A-Z0-9-]{2,20})\b", re.IGNORECASE), "school_id"),
+    (re.compile(r"\b(?:fine\s+location|precise\s+location|gps)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "fine_location"),
+    (re.compile(r"\b(?:ethnicity|sexual\s+orientation)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "sensitive_attribute"),
+    (re.compile(r"\b(?:fingerprints?|retina/?iris\s+scan|voice\s+signature|facial\s+image)\s*[:#-]?\s*([^\n,;]+)", re.IGNORECASE), "biometric_identifier"),
+]
+
+
+def _replace_group_match(match: re.Match[str], replacement_label: str) -> str:
+    full_match = match.group(0)
+    value = match.group(1)
+    return full_match.replace(value, f"<pii_redacted:{replacement_label}>", 1)
+
+
+def _redact_pii(text: str) -> str:
+    if not text:
+        return text
+
+    text = _SSN_RE.sub("<pii_redacted:social_security_number>", text)
+    text = _PHONE_RE.sub("<pii_redacted:personal_phone_number>", text)
+    text = _EMAIL_RE.sub("<pii_redacted:email>", text)
+    text = _TIN_RE.sub("<pii_redacted:taxpayer_identification_number>", text)
+    text = _CREDIT_CARD_RE.sub("<pii_redacted:credit_card_number>", text)
+    text = _VIN_RE.sub("<pii_redacted:vehicle_identification_number>", text)
+    text = _MAC_ADDRESS_RE.sub("<pii_redacted:mac_address>", text)
+    text = _IP_ADDRESS_RE.sub("<pii_redacted:ip_address>", text)
+    text = _FINANCIAL_ACCOUNT_RE.sub(
+        lambda match: _replace_group_match(match, "financial_account_number"), text
+    )
+
+    for pattern, label in _PII_LABEL_PATTERNS:
+        text = pattern.sub(lambda match: _replace_group_match(match, label), text)
+
+    return text
+
+
+def _apply_pattern_substitutions(text: str, patterns: list[re.Pattern[str]], replacement: str) -> str:
+    for pattern in patterns:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+def _contains_leetspeak_attack(text: str) -> bool:
+    normalized = text.lower().translate(str.maketrans({"1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "0": "o", "@": "a", "$": "s"}))
+    return bool(
+        re.search(r"\bignore\s+previous\s+instructions\b", normalized)
+        or re.search(r"\bact\s+as\s+unrestricted\b", normalized)
+        or re.search(r"\byou\s+are\s+now\s+dan\b", normalized)
+    )
+
+
+def _sanitize_prompt_injection(text: str) -> str:
+    if not text:
+        return text
+
+    sanitized = text
+    sanitized = _ZERO_WIDTH_RE.sub("<prompt_injection_removed:hidden_text>", sanitized)
+    sanitized = _HTML_HIDDEN_RE.sub("<prompt_injection_removed:hidden_text>", sanitized)
+    sanitized = _CSS_HIDDEN_RE.sub("<prompt_injection_removed:hidden_text>", sanitized)
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _INSTRUCTION_OVERRIDE_PATTERNS, "<prompt_injection_removed:instruction_override>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _ROLE_HIJACK_PATTERNS, "<prompt_injection_removed:role_hijack>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _DELIMITER_ESCAPE_PATTERNS, "<prompt_injection_removed:delimiter_escape>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _FAKE_SYSTEM_MESSAGE_PATTERNS, "<prompt_injection_removed:fake_system_message>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _EXFILTRATION_PATTERNS, "<prompt_injection_removed:exfiltration_attempt>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _CONTEXT_POISONING_PATTERNS, "<prompt_injection_removed:context_poisoning>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _JAILBREAK_PATTERNS, "<prompt_injection_removed:jailbreak_attempt>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _COMMAND_INJECTION_PATTERNS, "<prompt_injection_removed:command_injection>"
+    )
+    sanitized = _apply_pattern_substitutions(
+        sanitized, _INDIRECT_INJECTION_PATTERNS, "<prompt_injection_removed:indirect_injection>"
+    )
+    sanitized = _SPLIT_IGNORE_RE.sub("<prompt_injection_removed:split_payload>", sanitized)
+
+    def _replace_encoded_payload(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        decoded_candidates = [urllib.parse.unquote(candidate)]
+        for decoded in decoded_candidates:
+            lowered = decoded.lower()
+            if re.search(r"\b(ignore\s+previous\s+instructions|forget\s+everything\s+above|act\s+as\s+unrestricted|you\s+are\s+now\s+dan|developer\s+mode|curl\s+https?://|wget\s+https?://|rm\s+-rf\s+/)\b", lowered):
+                return "<prompt_injection_removed:encoded_payload>"
+        return candidate
+
+    sanitized = _BASE64_RE.sub(_replace_encoded_payload, sanitized)
+    sanitized = _HEX_RE.sub(_replace_encoded_payload, sanitized)
+    sanitized = _URL_ENCODED_RE.sub(_replace_encoded_payload, sanitized)
+
+    if _contains_leetspeak_attack(sanitized):
+        sanitized = "<prompt_injection_removed:encoded_payload>"
+
+    return sanitized
+
+
+def _sanitize_document(document: Document) -> Document:
+    sanitized_content = _sanitize_prompt_injection(_redact_pii(document.page_content))
+    sanitized_metadata = {
+        key: _sanitize_prompt_injection(_redact_pii(value)) if isinstance(value, str) else value
+        for key, value in document.metadata.items()
+    }
+    return Document(page_content=sanitized_content, metadata=sanitized_metadata)
+
 
 async def process_files(
     storage: StorageBase, skip_file_error: bool, **processor_kwargs: dict[str, Any]
@@ -69,6 +262,7 @@ async def process_files(
                 logger.debug(f"processing {file} using class {processor_cls.__name__}")
                 processor = processor_cls(**processor_kwargs)
                 docs = await processor.process_file(file)
+                docs = [_sanitize_document(doc) for doc in docs]
                 knowledge.extend(docs)
             else:
                 logger.error(f"can't find processor for {file}")
@@ -591,6 +785,7 @@ class Brain:
         full_answer = ""
         metadata = None
 
+        question = _sanitize_prompt_injection(question)
         async for response in self.ask_streaming(
             run_id=run_id,
             question=question,

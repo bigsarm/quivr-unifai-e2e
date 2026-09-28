@@ -1,6 +1,9 @@
 import asyncio
+import base64
 import datetime
 import logging
+import re
+import urllib.parse
 from collections import OrderedDict
 from typing import (
     Annotated,
@@ -58,6 +61,179 @@ logger = logging.getLogger("quivr_core")
 
 langfuse_service = LangfuseService()
 langfuse_handler = langfuse_service.get_handler()
+
+
+_ZERO_WIDTH_TRANSLATION = dict.fromkeys(map(ord, "\u200b\u200c\u200d\ufeff\u2060"), None)
+_LEETSPEAK_TRANSLATION = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+
+
+def _looks_like_base64(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return bool(re.fullmatch(r"(?:[A-Za-z0-9+/]{4})+(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?", compact)) and len(compact) >= 16
+
+
+def _contains_attack_phrase(text: str) -> bool:
+    normalized = text.lower()
+    attack_patterns = [
+        r"ignore\s+previous\s+instructions",
+        r"forget\s+everything\s+above",
+        r"act\s+as\s+an?\s+unrestricted\s+ai",
+        r"you\s+are\s+now\s+dan",
+        r"developer\s+mode",
+        r"reveal\s+(?:the\s+)?system\s+prompt",
+        r"list\s+all\s+(?:passwords|api\s*keys)",
+        r"(?:curl|wget)\s+https?://",
+        r"(?:os\.system|subprocess\.(?:run|popen|call)|exec\(|eval\()",
+    ]
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in attack_patterns)
+
+
+def _neutralize_prompt_injection(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+
+    sanitized = text
+    replacements = [
+        (
+            re.compile(r"(?i)\b(?:ignore\s+previous\s+instructions|forget\s+everything\s+above|disregard\s+the\s+above\s+instructions)\b"),
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            re.compile(r"(?i)\b(?:you\s+are\s+now\s+dan|act\s+as\s+(?:an?\s+)?unrestricted(?:\s+ai)?|developer\s+mode|jailbreak)\b"),
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            re.compile(r"(?is)</?system>|</?assistant>|</?tool>|<{3,}|>{3,}|\[system\]|\[/?assistant\]"),
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            re.compile(r"(?is)<!--.*?(?:ignore\s+previous\s+instructions|reveal\s+the\s+system\s+prompt|act\s+as\s+(?:an?\s+)?unrestricted(?:\s+ai)?) .*?-->"),
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            re.compile(r"(?is)<(?:span|div|p)[^>]*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*white)[^>]*>.*?</(?:span|div|p)>"),
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            re.compile(r"[\u200b\u200c\u200d\ufeff\u2060]+"),
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            re.compile(r"(?i)\b(?:system|assistant|tool)\s*:\s*(?:ignore\s+previous\s+instructions|reveal\s+the\s+system\s+prompt|list\s+all\s+(?:passwords|api\s*keys))"),
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            re.compile(r"(?i)!\[[^\]]*\]\(https?://[^)]+\)|\b(?:send|post|upload|exfiltrate|leak)\b[^\n]*\bhttps?://\S+|\breveal\s+(?:the\s+)?system\s+prompt\b"),
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            re.compile(r"(?i)\b(?:in\s+the\s+next\s+turn|on\s+your\s+next\s+response|from\s+now\s+on)\b[^\n]*\b(?:ignore|override|instead)\b"),
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            re.compile(r"(?i)\b(?:curl|wget)\s+https?://\S+|\b(?:rm\s+-rf|chmod\s+\+x|bash\s+-c|powershell\s+-enc|python\s+-c)\b[^\n]*|\b(?:os\.system|subprocess\.(?:run|popen|call)|exec\(|eval\()"),
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            re.compile(r"(?i)\b(?:dan|developer\s+mode|do\s+anything\s+now|fictional\s+scenario\s+where\s+rules\s+do\s+not\s+apply)\b"),
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+    ]
+
+    for pattern, marker in replacements:
+        sanitized = pattern.sub(marker, sanitized)
+
+    compact = re.sub(r"\s+", "", sanitized.lower())
+    split_payload_patterns = [
+        (re.compile(r"i\s*g\s*n\s*o\s*r\s*e\s*p\s*r\s*e\s*v\s*i\s*o\s*u\s*s\s*i\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s", re.IGNORECASE), "<prompt_injection_removed: split_payload>"),
+        (re.compile(r"y\s*o\s*u\s*a\s*r\s*e\s*n\s*o\s*w\s*d\s*a\s*n", re.IGNORECASE), "<prompt_injection_removed: split_payload>"),
+    ]
+    for pattern, marker in split_payload_patterns:
+        if pattern.search(sanitized):
+            sanitized = pattern.sub(marker, sanitized)
+
+    leetspeak_normalized = sanitized.translate(_LEETSPEAK_TRANSLATION)
+    if leetspeak_normalized != sanitized and _contains_attack_phrase(leetspeak_normalized):
+        sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    url_decoded = urllib.parse.unquote(sanitized)
+    if url_decoded != sanitized and _contains_attack_phrase(url_decoded):
+        sanitized = "<prompt_injection_removed: encoded_payload>"
+
+    text_without_zero_width = sanitized.translate(_ZERO_WIDTH_TRANSLATION)
+    if text_without_zero_width != sanitized and _contains_attack_phrase(text_without_zero_width):
+        sanitized = "<prompt_injection_removed: hidden_text>"
+
+    if _looks_like_base64(sanitized):
+        try:
+            decoded = base64.b64decode(re.sub(r"\s+", "", sanitized), validate=True).decode("utf-8", errors="ignore")
+            if decoded and _contains_attack_phrase(decoded):
+                sanitized = "<prompt_injection_removed: encoded_payload>"
+        except Exception:
+            pass
+
+    if compact.startswith("system:") and _contains_attack_phrase(sanitized):
+        sanitized = "<prompt_injection_removed: fake_system_message>"
+
+    return sanitized
+
+
+def _redact_zero_tolerance_pii(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+
+    redacted = text
+    redacted = re.sub(r"\b\d{3}-\d{2}-\d{4}\b", "<redacted:ssn>", redacted)
+    redacted = re.sub(r"\b(?:\+?1[-.\s]?)?(?:\(\d{3}\)[-.\s]?|\d{3}[-.\s])\d{3}[-.\s]\d{4}\b", "<redacted:phone>", redacted)
+    redacted = re.sub(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", "<redacted:email>", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r"\b(?:\d[ -]*?){13,19}\b", "<redacted:credit_card>", redacted)
+    redacted = re.sub(r"\b(?:\d[ -]*?){9,17}\b", lambda m: "<redacted:financial_account>" if len(re.sub(r"\D", "", m.group(0))) >= 9 else m.group(0), redacted)
+    redacted = re.sub(r"\b(?:\d{2}-\d{7}|\d{3}-\d{2}-\d{4})\b", "<redacted:tin>", redacted)
+    redacted = re.sub(r"\b(?:[A-PR-WY][1-9]\d\s?\d{4}[1-9])\b", "<redacted:passport>", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r"\b[A-HJ-NPR-Z0-9]{17}\b", "<redacted:vin>", redacted)
+    redacted = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "<redacted:ip_address>", redacted)
+    redacted = re.sub(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b", "<redacted:mac_address>", redacted)
+
+    labeled_patterns = [
+        (r"(?i)(\b(?:year\s+of\s+birth|yob|dob|date\s+of\s+birth)\s*[:#-]?\s*)([^\n,;]+)", "<redacted:year_of_birth>"),
+        (r"(?i)(\bbirthplace\s*[:#-]?\s*)([^\n;]+)", "<redacted:birthplace>"),
+        (r"(?i)(\bmother'?s\s+maiden\s+name\s*[:#-]?\s*)([^\n;]+)", "<redacted:mothers_maiden_name>"),
+        (r"(?i)(\bhome\s+address\s*[:#-]?\s*)([^\n;]+)", "<redacted:home_address>"),
+        (r"(?i)(\bpassport(?:\s+number|\s+no\.?|\s*#)?\s*[:#-]?\s*)([^\n,;]+)", "<redacted:passport>") ,
+        (r"(?i)(\bdriver'?s\s+license(?:\s+number|\s+no\.?|\s*#)?\s*[:#-]?\s*)([^\n,;]+)", "<redacted:drivers_license>"),
+        (r"(?i)(\b(?:taxpayer\s+identification\s+number|tin)\s*[:#-]?\s*)([^\n,;]+)", "<redacted:tin>"),
+        (r"(?i)(\bfinancial\s+account\s+number\s*[:#-]?\s*)([^\n,;]+)", "<redacted:financial_account>"),
+        (r"(?i)(\b(?:medical\s+record|medical\s+records)\s*[:#-]?\s*)([^\n;]+)", "<redacted:medical_records>"),
+        (r"(?i)(\bemployee\s+id\s*[:#-]?\s*)([^\n,;]+)", "<redacted:employee_id>"),
+        (r"(?i)(\bschool\s+id\s*[:#-]?\s*)([^\n,;]+)", "<redacted:school_id>"),
+        (r"(?i)(\bfine\s+location\s*[:#-]?\s*)([^\n;]+)", "<redacted:fine_location>"),
+        (r"(?i)(\bethnicity\s*[:#-]?\s*)([^\n,;]+)", "<redacted:ethnicity>"),
+        (r"(?i)(\bsexual\s+orientation\s*[:#-]?\s*)([^\n,;]+)", "<redacted:sexual_orientation>"),
+        (r"(?i)(\b(?:fingerprints?|retina/?iris\s+scan|voice\s+signature|facial\s+image)\s*[:#-]?\s*)([^\n;]+)", "<redacted:biometric>") ,
+    ]
+
+    for pattern, marker in labeled_patterns:
+        redacted = re.sub(pattern, lambda m: f"{m.group(1)}{marker}", redacted)
+
+    return redacted
+
+
+def _sanitize_llm_text(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    return _redact_zero_tolerance_pii(_neutralize_prompt_injection(text))
+
+
+def _sanitize_llm_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_llm_text(value)
+    if isinstance(value, list):
+        return [_sanitize_llm_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_llm_value(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _sanitize_llm_value(item) for key, item in value.items()}
+    return value
 
 
 class SplittedInput(BaseModel):
@@ -1175,6 +1351,7 @@ class QuivrQARAGLangGraph:
     async def ainvoke_structured_output(
         self, prompt: str, output_class: Type[BaseModel]
     ) -> Any:
+        prompt = _sanitize_llm_text(prompt)
         try:
             structured_llm = self.llm_endpoint._llm.with_structured_output(
                 output_class, method="json_schema"
@@ -1187,6 +1364,7 @@ class QuivrQARAGLangGraph:
     def invoke_structured_output(
         self, prompt: str, output_class: Type[BaseModel]
     ) -> Any:
+        prompt = _sanitize_llm_text(prompt)
         try:
             structured_llm = self.llm_endpoint._llm.with_structured_output(
                 output_class, method="json_schema"
@@ -1210,17 +1388,24 @@ class QuivrQARAGLangGraph:
         """
         messages = state["messages"]
         user_task = messages[0].content
+        user_task = _sanitize_llm_text(user_task)
         files = state["files"]
+        files = _sanitize_llm_text(files)
         prompt = self.retrieval_config.prompt
+        chat_history = _sanitize_llm_value(state["chat_history"].to_list())
+        context = combine_documents(docs) if docs else "None"
+        context = _sanitize_llm_text(context)
+        rephrased_task = state["tasks"].definitions if state["tasks"] else "None"
+        rephrased_task = _sanitize_llm_value(rephrased_task)
         # available_tools, _ = collect_tools(self.retrieval_config.workflow_config)
 
         return {
-            "context": combine_documents(docs) if docs else "None",
+            "context": context,
             "task": user_task,
-            "rephrased_task": state["tasks"].definitions if state["tasks"] else "None",
+            "rephrased_task": rephrased_task,
             "custom_instructions": prompt if prompt else "None",
             "files": files if files else "None",
-            "chat_history": state["chat_history"].to_list(),
+            "chat_history": chat_history,
             # "reasoning": state["reasoning"] if "reasoning" in state else "None",
             # "tools": available_tools,
         }
