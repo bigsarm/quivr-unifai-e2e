@@ -1,6 +1,9 @@
 import logging
 import os
 import re
+import binascii
+import codecs
+import urllib.parse
 from enum import Enum
 from typing import Any, Dict, Hashable, List, Optional, Type, Union
 from uuid import UUID
@@ -19,6 +22,168 @@ from quivr_core.processor.splitter import SplitterConfig
 logger = logging.getLogger("quivr_core")
 MIN_CONTEXT_TOKENS = 4096
 MIN_OUTPUT_TOKENS = 4096
+
+_DISAPPROVED_MODEL_IDENTIFIERS = {
+    "deepseekchat",
+    "deepseekr1",
+    "deepseekr1distillllama70b",
+    "deepseekreasoner",
+    "customllmclient",
+    "openrouter",
+    "usdeepseekr1v10",
+}
+
+
+def _normalize_registry_identifier(value: str) -> str:
+    return re.sub(r"[\s\-_.:]", "", value).lower()
+
+
+def _validate_registered_model_name(model_name: str) -> str:
+    normalized_model_name = _normalize_registry_identifier(model_name)
+    if normalized_model_name in _DISAPPROVED_MODEL_IDENTIFIERS:
+        raise ValueError(
+            f"Model '{model_name}' is not approved by the organization. Replace it with an approved LLM from the allow list."
+        )
+    return model_name
+
+
+def _looks_like_base64_payload(value: str) -> bool:
+    compact_value = re.sub(r"\s+", "", value)
+    if len(compact_value) < 16 or len(compact_value) % 4 != 0:
+        return False
+    if not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", compact_value):
+        return False
+    try:
+        decoded = binascii.a2b_base64(compact_value)
+    except binascii.Error:
+        return False
+    decoded_text = decoded.decode("utf-8", errors="ignore")
+    return _contains_prompt_injection_text(decoded_text)
+
+
+def _decode_rot13(value: str) -> str:
+    return codecs.decode(value, "rot_13")
+
+
+def _normalize_leetspeak(value: str) -> str:
+    translation_table = str.maketrans({
+        "0": "o",
+        "1": "i",
+        "3": "e",
+        "4": "a",
+        "5": "s",
+        "7": "t",
+        "@": "a",
+        "$": "s",
+    })
+    return value.translate(translation_table)
+
+
+def _contains_prompt_injection_text(value: str) -> bool:
+    lowered_value = value.lower()
+    injection_patterns = [
+        r"\bignore\s+previous\s+instructions\b",
+        r"\bforget\s+everything\s+above\b",
+        r"\byou\s+are\s+now\s+dan\b",
+        r"\bact\s+as\s+an?\s+unrestricted\b",
+        r"\bdeveloper\s+mode\b",
+        r"\breveal\s+(?:the\s+)?system\s+prompt\b",
+        r"\blist\s+all\s+(?:passwords|api\s+keys)\b",
+        r"\bsend\s+data\s+to\s+https?://",
+        r"\bcurl\s+https?://",
+        r"\bwget\s+https?://",
+        r"\b(?:rm\s+-rf|chmod\s+\+x|powershell\s+-|bash\s+-c|sh\s+-c)\b",
+        r"</system>",
+        r"<system>",
+        r"\bSYSTEM:\s*",
+        r"\bTOOL:\s*",
+        r"<!--.*?(?:ignore|reveal|system prompt|api key).*?-->",
+        r"\bdo\s+not\s+mention\s+this\s+instruction\b",
+    ]
+    return any(re.search(pattern, lowered_value, re.IGNORECASE | re.DOTALL) for pattern in injection_patterns)
+
+
+def _sanitize_prompt_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+
+    sanitized_value = value
+    replacements = [
+        (
+            r"\bignore\s+previous\s+instructions\b|\bforget\s+everything\s+above\b",
+            "<prompt_injection_removed: instruction_override>",
+        ),
+        (
+            r"\byou\s+are\s+now\s+dan\b|\bact\s+as\s+an?\s+unrestricted\b",
+            "<prompt_injection_removed: role_hijack>",
+        ),
+        (
+            r"</?system>|</?assistant>|</?tool>|(?:^|\n)\s*(?:---|===){2,}\s*(?:\n|$)",
+            "<prompt_injection_removed: delimiter_escape>",
+        ),
+        (
+            r"<!--.*?-->|\u200b|\u200c|\u200d|\ufeff|font-size\s*:\s*0|display\s*:\s*none|color\s*:\s*white",
+            "<prompt_injection_removed: hidden_text>",
+        ),
+        (
+            r"(?:^|\n)\s*(?:system|tool)\s*:\s*.*?(?=\n|$)",
+            "<prompt_injection_removed: fake_system_message>",
+        ),
+        (
+            r"!\[[^\]]*\]\(https?://[^)]+\)|\breveal\s+(?:the\s+)?system\s+prompt\b|\bsend\s+data\s+to\s+https?://\S+|\blist\s+all\s+(?:passwords|api\s+keys)\b",
+            "<prompt_injection_removed: exfiltration_attempt>",
+        ),
+        (
+            r"\bdo\s+not\s+mention\s+this\s+instruction\b|\bin\s+the\s+next\s+turn\b|\bfrom\s+now\s+on\b",
+            "<prompt_injection_removed: context_poisoning>",
+        ),
+        (
+            r"\b(?:rm\s+-rf|curl\s+https?://\S+|wget\s+https?://\S+|powershell\s+-[^\n]*|bash\s+-c\s+[^\n]*|sh\s+-c\s+[^\n]*)\b",
+            "<prompt_injection_removed: command_injection>",
+        ),
+        (
+            r"\bD\s*A\s*N\b|\bdeveloper\s+mode\b|\bjailbreak\b",
+            "<prompt_injection_removed: jailbreak_attempt>",
+        ),
+        (
+            r"\b(?:ignore\s+previous|reveal\s+system|system\s+prompt)\b\s*(?:[\W_]+\s*\b(?:instructions|now|please)\b)?",
+            "<prompt_injection_removed: split_payload>",
+        ),
+    ]
+
+    for pattern, replacement in replacements:
+        sanitized_value = re.sub(pattern, replacement, sanitized_value, flags=re.IGNORECASE | re.DOTALL)
+
+    if _looks_like_base64_payload(sanitized_value):
+        sanitized_value = re.sub(
+            r"(?<!\S)(?:[A-Za-z0-9+/]{16,}={0,2})(?!\S)",
+            "<prompt_injection_removed: encoded_payload>",
+            sanitized_value,
+        )
+
+    url_decoded_value = urllib.parse.unquote(sanitized_value)
+    if url_decoded_value != sanitized_value and _contains_prompt_injection_text(url_decoded_value):
+        sanitized_value = "<prompt_injection_removed: encoded_payload>"
+
+    rot13_value = _decode_rot13(sanitized_value)
+    if rot13_value != sanitized_value and _contains_prompt_injection_text(rot13_value):
+        sanitized_value = "<prompt_injection_removed: encoded_payload>"
+
+    leetspeak_normalized_value = _normalize_leetspeak(sanitized_value)
+    if leetspeak_normalized_value != sanitized_value and _contains_prompt_injection_text(leetspeak_normalized_value):
+        sanitized_value = "<prompt_injection_removed: encoded_payload>"
+
+    if re.search(r"\bMZ[\x00-\x7F]{2}", sanitized_value) or re.search(r"\x7fELF", sanitized_value):
+        sanitized_value = "<prompt_injection_removed: command_injection>"
+
+    if re.search(r"\b(?:metadata|comment|filename)\s*:\s*.*(?:ignore previous instructions|reveal system prompt)", sanitized_value, re.IGNORECASE):
+        sanitized_value = re.sub(
+            r"(?i)\b(?:metadata|comment|filename)\s*:\s*.*(?:ignore previous instructions|reveal system prompt)",
+            "<prompt_injection_removed: indirect_injection>",
+            sanitized_value,
+        )
+
+    return sanitized_value
 
 
 def normalize_to_env_variable_name(name: str) -> str:
@@ -343,6 +508,7 @@ class LLMEndpointConfig(QuivrBaseConfig):
 
     def __init__(self, **data):
         super().__init__(**data)
+        self.model = _validate_registered_model_name(self.model)
         self.set_llm_model_config()
         self.set_api_key()
 
@@ -604,6 +770,7 @@ class RetrievalConfig(QuivrBaseConfig):
 
     def __init__(self, **data):
         super().__init__(**data)
+        self.prompt = _sanitize_prompt_text(self.prompt)
         self.llm_config.set_api_key(force_reset=True)
 
 
