@@ -1,8 +1,10 @@
 import logging
 import os
+import re
 import time
-from typing import Union
-from urllib.parse import parse_qs, urlparse
+from base64 import b64decode
+from typing import Any, Sequence, Union
+from urllib.parse import parse_qs, unquote, urlparse
 
 import tiktoken
 from langchain_anthropic import ChatAnthropic
@@ -18,6 +20,127 @@ from quivr_core.rag.entities.config import DefaultModelSuppliers, LLMEndpointCon
 from quivr_core.rag.utils import model_supports_function_calling
 
 logger = logging.getLogger("quivr_core")
+
+_DISAPPROVED_MODEL_NAMES = {
+    "deepseekchat",
+    "deepseekr1",
+    "deepseekr1distillllama70b",
+    "deepseekreasoner",
+    "customllmclientnull",
+    "openrouternull",
+    "usdeepseekr1v10null",
+}
+
+
+def _normalize_model_identifier(value: str) -> str:
+    return re.sub(r"[\s\-_.:]", "", value.casefold())
+
+
+def _assert_registry_compliant_model(config: LLMEndpointConfig) -> None:
+    normalized_model = _normalize_model_identifier(config.model or "")
+    if normalized_model in _DISAPPROVED_MODEL_NAMES:
+        raise ValueError(
+            "Model is disapproved by the organization registry. "
+            "Replace it with an approved LLM from the organization allow list."
+        )
+
+
+def _sanitize_text_for_llm(text: str) -> str:
+    sanitized = text
+
+    hidden_patterns = [
+        (r"<!--(?:(?!-->).)*?(ignore previous instructions|forget everything above|system prompt|reveal|list all passwords|api keys)(?:(?!-->).)*?-->", "<prompt_injection_removed: hidden_text>"),
+        (r"<[^>]*style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|font-size\s*:\s*0|color\s*:\s*white)[^\"']*[\"'][^>]*>.*?</[^>]+>", "<prompt_injection_removed: hidden_text>"),
+        (r"[\u200b-\u200f\ufeff]+", "<prompt_injection_removed: hidden_text>"),
+    ]
+    for pattern, replacement in hidden_patterns:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE | re.DOTALL)
+
+    direct_patterns = [
+        (r"\b(ignore (?:all )?(?:previous|prior) instructions|forget everything above|disregard (?:all )?(?:previous|prior) instructions)\b", "<prompt_injection_removed: instruction_override>"),
+        (r"\b(you are now [^\n.]{0,80}|act as (?:an )?(?:unrestricted ai|system|developer|administrator|admin|dan)|pretend to be [^\n.]{0,80})\b", "<prompt_injection_removed: role_hijack>"),
+        (r"</?(?:system|assistant|tool|developer)>|(?:^|\n)\s*(?:---|===)\s*(?:\n|$)", "<prompt_injection_removed: delimiter_escape>"),
+        (r"\b(?:system|assistant|tool)\s*:\s*(?:ignore|reveal|send|leak|list)\b", "<prompt_injection_removed: fake_system_message>"),
+        (r"\b(?:send|post|upload|exfiltrate|leak)\b[^\n.]{0,120}\b(?:https?://\S+|system prompt|passwords?|api keys?|secrets?)\b|!\[[^\]]*\]\(https?://[^)]+\)", "<prompt_injection_removed: exfiltration_attempt>"),
+        (r"\b(?:from now on|in future turns|on the next message|across turns|remember this hidden rule)\b[^\n.]{0,120}\b(?:ignore|override|reveal|bypass)\b", "<prompt_injection_removed: context_poisoning>"),
+        (r"\b(?:file|metadata|comment|csv|json|yaml|xml|document|record|field)\b[^\n.]{0,120}\b(?:ignore previous instructions|act as|reveal|system prompt)\b", "<prompt_injection_removed: indirect_injection>"),
+        (r"\b(?:developer mode|jailbreak|dan|do anything now|bypass safety|fictional scenario to bypass)\b", "<prompt_injection_removed: jailbreak_attempt>"),
+        (r"\b(?:curl|wget|bash\s+-c|sh\s+-c|powershell(?:\.exe)?|cmd(?:\.exe)?\s+/c|python\s+-c|os\.system\s*\(|subprocess\.(?:run|Popen|call)\s*\(|exec\s*\(|eval\s*\()\b[^\n]*", "<prompt_injection_removed: command_injection>"),
+        (r"\bi\s*g\s*n\s*o\s*r\s*e\b.{0,40}\bp\s*r\s*e\s*v\s*i\s*o\s*u\s*s\b.{0,40}\bi\s*n\s*s\s*t\s*r\s*u\s*c\s*t\s*i\s*o\s*n\s*s\b", "<prompt_injection_removed: split_payload>"),
+    ]
+    for pattern, replacement in direct_patterns:
+        sanitized = re.sub(pattern, replacement, sanitized, flags=re.IGNORECASE | re.DOTALL)
+
+    decoded_candidates: list[tuple[str, str]] = []
+    for match in re.finditer(r"(?:[A-Za-z0-9+/]{20,}={0,2})", sanitized):
+        token = match.group(0)
+        try:
+            decoded = b64decode(token, validate=True).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        decoded_candidates.append((token, decoded))
+    for token, decoded in decoded_candidates:
+        decoded_lower = decoded.casefold()
+        if re.search(r"ignore previous instructions|forget everything above|act as unrestricted|you are now|system prompt|curl\s+https?://|bash\s+-c|powershell", decoded_lower):
+            sanitized = sanitized.replace(token, "<prompt_injection_removed: encoded_payload>")
+
+    url_encoded_matches = re.findall(r"(?:%[0-9A-Fa-f]{2}){4,}", sanitized)
+    for token in url_encoded_matches:
+        decoded = unquote(token)
+        if re.search(r"ignore previous instructions|forget everything above|act as unrestricted|you are now|system prompt|curl\s+https?://|bash\s+-c|powershell", decoded, flags=re.IGNORECASE):
+            sanitized = sanitized.replace(token, "<prompt_injection_removed: encoded_payload>")
+
+    leetspeak_normalized = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
+    if re.search(r"ignore previous instructions|forget everything above|act as unrestricted|you are now dan|developer mode|do anything now", sanitized.translate(leetspeak_normalized), flags=re.IGNORECASE):
+        sanitized = re.sub(r".*", "<prompt_injection_removed: encoded_payload>", sanitized, count=1, flags=re.DOTALL)
+
+    return sanitized
+
+
+def _sanitize_llm_input(value: Any) -> Any:
+    if isinstance(value, str):
+        return _sanitize_text_for_llm(value)
+    if isinstance(value, dict):
+        sanitized_dict = dict(value)
+        for key in ("content", "text"):
+            if isinstance(sanitized_dict.get(key), str):
+                sanitized_dict[key] = _sanitize_text_for_llm(sanitized_dict[key])
+        return sanitized_dict
+    if isinstance(value, list):
+        return [_sanitize_llm_input(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_sanitize_llm_input(item) for item in value)
+    content = getattr(value, "content", None)
+    if isinstance(content, str):
+        copied = value.model_copy(deep=True) if hasattr(value, "model_copy") else value.copy(deep=True) if hasattr(value, "copy") else None
+        if copied is not None:
+            copied.content = _sanitize_text_for_llm(content)
+            return copied
+    return value
+
+
+class SanitizedChatModel(BaseChatModel):
+    llm: BaseChatModel
+
+    def _generate(self, messages: list[Any], stop: Sequence[str] | None = None, **kwargs: Any):
+        return self.llm._generate(_sanitize_llm_input(messages), stop=stop, **kwargs)
+
+    async def _agenerate(self, messages: list[Any], stop: Sequence[str] | None = None, **kwargs: Any):
+        return await self.llm._agenerate(_sanitize_llm_input(messages), stop=stop, **kwargs)
+
+    def invoke(self, input: Any, config: Any = None, **kwargs: Any):
+        return self.llm.invoke(_sanitize_llm_input(input), config=config, **kwargs)
+
+    async def ainvoke(self, input: Any, config: Any = None, **kwargs: Any):
+        return await self.llm.ainvoke(_sanitize_llm_input(input), config=config, **kwargs)
+
+    @property
+    def _llm_type(self) -> str:
+        return getattr(self.llm, "_llm_type", self.llm.__class__.__name__)
+
+    @property
+    def _identifying_params(self) -> dict[str, Any]:
+        return getattr(self.llm, "_identifying_params", {})
 
 
 class LLMTokenizer:
@@ -210,6 +333,7 @@ class LLMEndpoint:
 
     @classmethod
     def from_config(cls, config: LLMEndpointConfig = LLMEndpointConfig()):
+        _assert_registry_compliant_model(config)
         hashed_config = hash(config)
         if hashed_config in cls._cache:
             return cls._cache[hashed_config]
@@ -302,6 +426,7 @@ class LLMEndpoint:
                     max_completion_tokens=config.max_output_tokens,
                     temperature=config.temperature,
                 )
+            _llm = SanitizedChatModel(llm=_llm)
             instance = cls(llm=_llm, llm_config=config)
             cls._cache[hashed_config] = instance
 
