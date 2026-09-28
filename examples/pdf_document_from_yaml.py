@@ -1,6 +1,8 @@
 import asyncio
 import logging
 import os
+import re
+import tempfile
 from pathlib import Path
 
 import dotenv
@@ -22,6 +24,52 @@ logger.addHandler(ConsoleOutputHandler)
 
 # Install rich's traceback handler to automatically format tracebacks
 rich_install()
+
+
+_ai_dat_sec_023_PII_PATTERNS = {
+    "ssn": re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),
+    "year_of_birth": re.compile(r"\b(?:19\d{2}|20(?:0\d|1\d|2[0-4]))\b"),
+    "birthplace": re.compile(r"\bBirthplace\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "personal_phone": re.compile(r"\b(?:\+?\d{1,3}[\s.-]?)?(?:\(?\d{2,4}\)?[\s.-]?)\d{3,4}[\s.-]?\d{4,}\b"),
+    "email": re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
+    "mothers_maiden_name": re.compile(r"\bMother'?s Maiden Name\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "home_address": re.compile(r"\bAddress\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "passport_number": re.compile(r"\b[A-Z0-9]{6,9}\b"),
+    "drivers_license_number": re.compile(r"\bDriver'?s License Number\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "tin": re.compile(r"\b\d{2}-\d{7}\b"),
+    "credit_card": re.compile(r"\b(?:\d[ -]*?){13,19}\b"),
+    "financial_account": re.compile(r"\bAccount Number\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "employee_id": re.compile(r"\bEmployee Id\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "school_id": re.compile(r"\bSchool Id\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "vin": re.compile(r"\b[A-HJ-NPR-Z0-9]{17}\b"),
+    "ip_address": re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
+    "mac_address": re.compile(r"\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b"),
+    "fine_location": re.compile(r"\b(?:Latitude|Longitude|Coordinates)\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "ethnicity": re.compile(r"\bEthnicity\s*:\s*[^\n\r]+", re.IGNORECASE),
+    "sexual_orientation": re.compile(r"\bSexual Orientation\s*:\s*[^\n\r]+", re.IGNORECASE),
+}
+
+
+def _ai_dat_sec_023_redact_text(_ai_dat_sec_023_text: str) -> str:
+    _ai_dat_sec_023_redacted = _ai_dat_sec_023_text
+    for _ai_dat_sec_023_label, _ai_dat_sec_023_pattern in _ai_dat_sec_023_PII_PATTERNS.items():
+        _ai_dat_sec_023_redacted = _ai_dat_sec_023_pattern.sub(
+            f"[REDACTED {_ai_dat_sec_023_label.upper()}]", _ai_dat_sec_023_redacted
+        )
+    return _ai_dat_sec_023_redacted
+
+
+def _ai_dat_sec_023_prepare_uploaded_file(_ai_dat_sec_023_path: Path) -> Path:
+    _ai_dat_sec_023_bytes = _ai_dat_sec_023_path.read_bytes()
+    _ai_dat_sec_023_text = _ai_dat_sec_023_bytes.decode("latin-1")
+    _ai_dat_sec_023_redacted_text = _ai_dat_sec_023_redact_text(_ai_dat_sec_023_text)
+    if _ai_dat_sec_023_redacted_text == _ai_dat_sec_023_text:
+        return _ai_dat_sec_023_path
+
+    _ai_dat_sec_023_suffix = _ai_dat_sec_023_path.suffix or ".tmp"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=_ai_dat_sec_023_suffix) as _ai_dat_sec_023_tmp:
+        _ai_dat_sec_023_tmp.write(_ai_dat_sec_023_redacted_text.encode("latin-1"))
+        return Path(_ai_dat_sec_023_tmp.name)
 
 
 async def main():
@@ -47,6 +95,8 @@ async def main():
         "megaparse_config": megaparse_config,
         "splitter_config": assistant_config.ingestion_config.parser_config.splitter_config,
     }
+
+    file_path = [_ai_dat_sec_023_prepare_uploaded_file(path) for path in file_path]
 
     brain = await Brain.afrom_files(
         name="test_brain",
