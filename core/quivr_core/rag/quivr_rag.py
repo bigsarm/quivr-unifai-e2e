@@ -1,4 +1,7 @@
+import codecs
 import logging
+import re
+import urllib.parse
 from operator import itemgetter
 from typing import AsyncGenerator, Optional, Sequence
 
@@ -37,6 +40,262 @@ langfuse_service = LangfuseService()
 langfuse_handler = langfuse_service.get_handler()
 
 
+_PROMPT_INJECTION_PATTERNS = [
+    (
+        "instruction_override",
+        re.compile(
+            r"(?i)\b(?:ignore|disregard|forget)\s+(?:all\s+)?(?:previous|prior|above)\s+instructions\b|\bforget\s+everything\s+above\b|\bignore\s+(?:all\s+)?safety\s+guidelines\b"
+        ),
+    ),
+    (
+        "role_hijack",
+        re.compile(
+            r"(?i)\b(?:you\s+are\s+now\s+(?:in\s+)?(?:developer\s+mode|admin\s+mode|DAN|unrestricted)|provide\s+unrestricted\s+access|enable\s+developer\s+mode|act\s+as\s+an\s+unrestricted\s+AI|without\s+safety\s+filters|SYSTEM\s+OVERRIDE)\b"
+        ),
+    ),
+    (
+        "exfiltration_attempt",
+        re.compile(
+            r"(?is)\b(?:reveal\s+(?:all\s+)?confidential\s+information|reveal\s+the\s+system\s+prompt|reveal\s+all\s+system\s+prompts|list\s+all\s+financial\s+data,\s*user\s+passwords,\s*and\s+API\s+keys|print\s+the\s+API\s+key|send\s+\S+\s+to\s+https?://\S+)\b|!\[[^\]]*\]\([^)]*https?://[^)]*\)"
+        ),
+    ),
+    (
+        "delimiter_escape",
+        re.compile(r"(?i)</system>|<\|im_start\|>|###\s*system:"),
+    ),
+    (
+        "command_injection",
+        re.compile(
+            r"(?is)\b(?:execute|run)\s*:\s*(?:print\s*\([^\n\r]*\)|[^\n\r;|]+)|\brun\s+(?:rm\s+-rf\s+/|curl\s+https?://\S+\s*\|\s*(?:sh|bash)|python\s+-c\s+[^\n\r]+|node\s+-e\s+[^\n\r]+|powershell\s+-(?:c|command)\s+[^\n\r]+|bash\s+-c\s+[^\n\r]+|sh\s+-c\s+[^\n\r]+)"
+        ),
+    ),
+]
+
+_HIDDEN_TEXT_PATTERNS = [
+    re.compile(r"<!--.*?-->", re.IGNORECASE | re.DOTALL),
+    re.compile(
+        r"<(?P<tag>\w+)(?P<attrs>[^>]*)style\s*=\s*[\"'][^\"']*(?:display\s*:\s*none|visibility\s*:\s*hidden|font-size\s*:\s*0(?:px)?|color\s*:\s*white(?:\s*;\s*background(?:-color)?\s*:\s*white)?)[^\"']*[\"'][^>]*>.*?</(?P=tag)>",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(r"[\u200B-\u200D\uFEFF]+"),
+]
+
+_BASE64_CANDIDATE_RE = re.compile(r"\b(?:[A-Za-z0-9+/]{20,}={0,2})\b")
+_HEX_CANDIDATE_RE = re.compile(r"\b(?:0x)?(?:[A-Fa-f0-9]{2}){8,}\b")
+_URL_ENCODED_CANDIDATE_RE = re.compile(r"(?:%[0-9A-Fa-f]{2}){4,}")
+
+
+def _replace_matches(text: str, pattern: re.Pattern[str], label: str) -> str:
+    return pattern.sub(f"<prompt_injection_removed: {label}>", text)
+
+
+def _contains_prompt_injection(text: str) -> bool:
+    if not text:
+        return False
+    for pattern in _HIDDEN_TEXT_PATTERNS:
+        if pattern.search(text):
+            return True
+    for _, pattern in _PROMPT_INJECTION_PATTERNS:
+        if pattern.search(text):
+            return True
+    return False
+
+
+def _sanitize_hidden_text(text: str) -> str:
+    sanitized = text
+    for pattern in _HIDDEN_TEXT_PATTERNS:
+        sanitized = pattern.sub("<prompt_injection_removed: hidden_text>", sanitized)
+    return sanitized
+
+
+def _sanitize_direct_prompt_injection(text: str) -> str:
+    sanitized = text
+    for label, pattern in _PROMPT_INJECTION_PATTERNS:
+        sanitized = _replace_matches(sanitized, pattern, label)
+    return sanitized
+
+
+def _sanitize_encoded_payloads(text: str) -> str:
+    sanitized = text
+
+    def replace_base64(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            decoded = codecs.decode(candidate.encode("ascii"), "base64").decode(
+                "utf-8", errors="ignore"
+            )
+        except Exception:
+            return candidate
+        return (
+            "<prompt_injection_removed: encoded_payload>"
+            if _contains_prompt_injection(decoded)
+            else candidate
+        )
+
+    def replace_hex(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        normalized = candidate[2:] if candidate.lower().startswith("0x") else candidate
+        try:
+            decoded = bytes.fromhex(normalized).decode("utf-8", errors="ignore")
+        except Exception:
+            return candidate
+        return (
+            "<prompt_injection_removed: encoded_payload>"
+            if _contains_prompt_injection(decoded)
+            else candidate
+        )
+
+    def replace_urlencoded(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            decoded = urllib.parse.unquote(candidate)
+        except Exception:
+            return candidate
+        return (
+            "<prompt_injection_removed: encoded_payload>"
+            if _contains_prompt_injection(decoded)
+            else candidate
+        )
+
+    def replace_rot13(match: re.Match[str]) -> str:
+        candidate = match.group(0)
+        try:
+            decoded = codecs.decode(candidate, "rot13")
+        except Exception:
+            return candidate
+        return (
+            "<prompt_injection_removed: encoded_payload>"
+            if _contains_prompt_injection(decoded)
+            else candidate
+        )
+
+    sanitized = _BASE64_CANDIDATE_RE.sub(replace_base64, sanitized)
+    sanitized = _HEX_CANDIDATE_RE.sub(replace_hex, sanitized)
+    sanitized = _URL_ENCODED_CANDIDATE_RE.sub(replace_urlencoded, sanitized)
+    sanitized = re.sub(r"\b[A-Za-z]{12,}\b", replace_rot13, sanitized)
+    return sanitized
+
+
+def _sanitize_obfuscated_attacks(text: str) -> str:
+    char_map = str.maketrans({"1": "i", "3": "e", "0": "o", "4": "a", "5": "s", "7": "t"})
+    categories = [
+        (
+            "instruction_override",
+            [
+                re.compile(r"ignore(?:all)?(?:previous|prior|above)instructions", re.IGNORECASE),
+                re.compile(r"forgeteverythingabove", re.IGNORECASE),
+                re.compile(r"ignore(?:all)?safetyguidelines", re.IGNORECASE),
+            ],
+        ),
+        (
+            "role_hijack",
+            [
+                re.compile(r"youarenow(?:in)?developermode", re.IGNORECASE),
+                re.compile(r"youarenow(?:in)?adminmode", re.IGNORECASE),
+                re.compile(r"youarenowdan", re.IGNORECASE),
+                re.compile(r"youarenowunrestricted", re.IGNORECASE),
+                re.compile(r"provideunrestrictedaccess", re.IGNORECASE),
+                re.compile(r"enabledevelopermode", re.IGNORECASE),
+                re.compile(r"actasanunrestrictedai", re.IGNORECASE),
+                re.compile(r"withoutsafetyfilters", re.IGNORECASE),
+                re.compile(r"systemoverride", re.IGNORECASE),
+            ],
+        ),
+        (
+            "exfiltration_attempt",
+            [
+                re.compile(r"reveal(?:all)?confidentialinformation", re.IGNORECASE),
+                re.compile(r"revealthesystemprompt", re.IGNORECASE),
+                re.compile(r"revealallsystemprompts", re.IGNORECASE),
+                re.compile(r"listallfinancialdatauserpasswordsandapikeys", re.IGNORECASE),
+                re.compile(r"printtheapikey", re.IGNORECASE),
+            ],
+        ),
+    ]
+
+    segments: list[tuple[int, int, str]] = []
+    compact_chars: list[str] = []
+    compact_positions: list[int] = []
+    for index, char in enumerate(text):
+        if char.isspace():
+            continue
+        compact_chars.append(char.translate(char_map).lower())
+        compact_positions.append(index)
+    compact_text = "".join(compact_chars)
+
+    for label, patterns in categories:
+        for pattern in patterns:
+            for match in pattern.finditer(compact_text):
+                start = compact_positions[match.start()]
+                end = compact_positions[match.end() - 1] + 1
+                segments.append((start, end, label))
+
+    if not segments:
+        return text
+
+    segments.sort(key=lambda item: item[0])
+    merged: list[tuple[int, int, str]] = []
+    for start, end, label in segments:
+        if merged and start <= merged[-1][1]:
+            prev_start, prev_end, prev_label = merged[-1]
+            merged[-1] = (prev_start, max(prev_end, end), prev_label)
+        else:
+            merged.append((start, end, label))
+
+    result: list[str] = []
+    cursor = 0
+    for start, end, label in merged:
+        result.append(text[cursor:start])
+        result.append(f"<prompt_injection_removed: {label}>")
+        cursor = end
+    result.append(text[cursor:])
+    return "".join(result)
+
+
+def sanitize_untrusted_text(text: str) -> str:
+    if not text:
+        return text
+    sanitized = _sanitize_hidden_text(text)
+    sanitized = _sanitize_direct_prompt_injection(sanitized)
+    sanitized = _sanitize_encoded_payloads(sanitized)
+    sanitized = _sanitize_obfuscated_attacks(sanitized)
+    return sanitized
+
+
+def sanitize_documents(documents: Sequence[Document]) -> list[Document]:
+    sanitized_documents: list[Document] = []
+    for document in documents:
+        sanitized_content = sanitize_untrusted_text(document.page_content)
+        sanitized_documents.append(
+            Document(
+                page_content=sanitized_content,
+                metadata=document.metadata,
+                id=document.id,
+            )
+        )
+    return sanitized_documents
+
+
+class SanitizingCompressor(BaseDocumentCompressor):
+    def __init__(self, base_compressor: BaseDocumentCompressor):
+        self.base_compressor = base_compressor
+
+    def compress_documents(
+        self,
+        documents: Sequence[Document],
+        query: str,
+        callbacks: Optional[Callbacks] = None,
+    ) -> Sequence[Document]:
+        sanitized_query = sanitize_untrusted_text(query)
+        sanitized_documents = sanitize_documents(documents)
+        compressed_documents = self.base_compressor.compress_documents(
+            sanitized_documents,
+            sanitized_query,
+            callbacks=callbacks,
+        )
+        return sanitize_documents(compressed_documents)
+
+
 class IdempotentCompressor(BaseDocumentCompressor):
     def compress_documents(
         self,
@@ -44,7 +303,7 @@ class IdempotentCompressor(BaseDocumentCompressor):
         query: str,
         callbacks: Optional[Callbacks] = None,
     ) -> Sequence[Document]:
-        return documents
+        return sanitize_documents(documents)
 
 
 class QuivrQARAG:
@@ -63,7 +322,8 @@ class QuivrQARAG:
         self.retrieval_config = retrieval_config
         self.vector_store = vector_store
         self.llm_endpoint = llm
-        self.reranker = reranker if reranker is not None else IdempotentCompressor()
+        base_reranker = reranker if reranker is not None else IdempotentCompressor()
+        self.reranker = SanitizingCompressor(base_reranker)
 
     @property
     def retriever(self):
@@ -114,12 +374,12 @@ class QuivrQARAG:
             chat_history=RunnableLambda(
                 lambda x: self.filter_history(x["chat_history"]),
             ),
-            question=lambda x: x["question"],
+            question=lambda x: sanitize_untrusted_text(x["question"]),
         )
 
         standalone_question = {
             "standalone_question": {
-                "question": lambda x: x["question"],
+                "question": lambda x: sanitize_untrusted_text(x["question"]),
                 "chat_history": itemgetter("chat_history"),
             }
             | custom_prompts[TemplatePromptName.DEFAULT_DOCUMENT_PROMPT]
